@@ -2,68 +2,48 @@ import cv2 as cv
 import numpy as np
 import matplotlib.pyplot as plt
 import sys
-import json
+import pickle
 import os
 import scipy
-
-def load_image_params(param_file_path):
-    param_file = open(param_file_path)
-    return json.load(param_file)
-
-def load_database(path_to_database):
-    param_file_path = os.path.join(path_to_database, 'image_info.json')
-    database = load_image_params(param_file_path)
-    sift = cv.SIFT_create()
-
-    for name, info in database.items():
-        image_path = os.path.join(path_to_database, name)
-        info['image'] = cv.imread(image_path)
-        info['kp'] = sift.detectAndCompute(info['image'], None)
-    return database
+import database as db
 
 def _match_database_s(query, database, 
         point_match_threshold = 0.7, 
         discrimination_threshold = 0.6,
-        max_matches = 3):
+        max_matches = 5):
     """
     Returns the feature matches for the database and the query image.
     """
     
-    sift = cv.SIFT_create()
+    orb = cv.ORB_create()
+    matcher = db.make_matcher()
 
     # get keypoints and descriptor for query
-    query_kp, query_des = sift.detectAndCompute(query,None)
+    query_kp, query_desc = orb.detectAndCompute(query,None)
 
     db_matches = []
     max_match_count = 0
 
     # do matches with every image in the database
     for name, info in database.items():
-        # get keypoints and descriptor for database images
-        FLANN_INDEX_KDTREE = 1
-        index_params = dict(algorithm = FLANN_INDEX_KDTREE, trees = 5)
-        search_params = dict(checks = 50)
-        flann = cv.FlannBasedMatcher(index_params, search_params)
-        matches = flann.knnMatch(query_des, info['kp'][1],k=2)
-
-        good_matches = []
+        matches = db.match_images(query_desc, info['desc'], matcher,
+                point_match_threshold)
         qp = []
         dp = []
 
-        for m,n in matches:
-            if m.distance < point_match_threshold * n.distance:
-                good_matches.append(m)
-                qp.append(query_kp[m.queryIdx].pt)
-                dp.append(info['kp'][0][m.trainIdx].pt)
-        
-        if len(good_matches) != 0:
+        for m in matches:
+            qp.append(query_kp[m.queryIdx].pt)
+            dp.append(info['kp'][m.trainIdx].pt)
+
+
+        if len(matches) != 0:
             db_matches.append(
                 {'matches': (np.transpose(np.array(qp)), np.transpose(np.array(dp))),
                  'pos': np.array(info['pos']),
                  'dir': np.array(info['view_dir']),
                  'so_mat': np.array(info['so_mat'])})
 
-        l = len(good_matches)
+        l = len(matches)
 
         if max_match_count < l:
             max_match_count = l
@@ -72,10 +52,10 @@ def _match_database_s(query, database,
     # multiplicative (log) distance from the max that we will keep.
     best_match_threshold = max_match_count * discrimination_threshold
     good_matches = []
-
+    
     for matches in db_matches:
         if best_match_threshold <= matches['matches'][0].shape[1]:
-            good_matches.append(matches)
+            good_matches.append([matches])
 
     # If we have more than max_matches, we likely have a false positive match.
     # Let's return nothing to indicate that, well, we found nothing. 
@@ -87,7 +67,7 @@ def _match_database_s(query, database,
 def _match_database_multi(query, database, 
         point_match_threshold = 0.7, 
         discrimination_threshold = 0.6,
-        max_matches = 3,
+        max_matches = 5,
         numthreads = 16):
     
     import threading
@@ -102,49 +82,43 @@ def _match_database_multi(query, database,
     finished = False
 
     def match_worker():
-        # make local sift and matcher
-        sift = cv.SIFT_create()
+        # make local orb and matcher
+        orb = cv.SIFT_create()
+        bf = cv.BFMatcher(cv.NORM_HAMMING, crossCheck = True)
+    
+        query_kp, query_des = orb.detectAndCompute(query,None)
         
-        query_kp, query_des = sift.detectAndCompute(query,None)
-        
-        FLANN_INDEX_KDTREE = 1
-        index_params = dict(algorithm = FLANN_INDEX_KDTREE, trees = 5)
-        search_params = dict(checks = 50)
 
         while not finished:
             try:
                 work = matching_queue.get(timeout=0.01)
-                good_matches = []
+     
+                matches = db.match_images(query_desc, info['desc'], matcher,
+                point_match_threshold)
                 qp = []
                 dp = []
-        
-                flann = cv.FlannBasedMatcher(index_params, search_params)
-                matches = flann.knnMatch(query_des, work['kp'][1],k=2)
 
-                for m,n in matches:
-                    if m.distance < point_match_threshold * n.distance:
-                        good_matches.append(m)
-                        qp.append(query_kp[m.queryIdx].pt)
-                        dp.append(info['kp'][0][m.trainIdx].pt)
+                for m in matches:
+                    qp.append(query_kp[m.queryIdx].pt)
+                    dp.append(info['kp'][m.trainIdx].pt)
                 
-                match_lock.acquire()
-                if len(good_matches) != 0:
+                if len(matches) != 0:
+                    match_lock.acquire()
                     db_matches.append(
                         {'matches': (np.transpose(np.array(qp)), 
                             np.transpose(np.array(dp))),
                          'pos': np.array(info['pos']),
                          'dir': np.array(info['view_dir']),
                          'so_mat': np.array(info['so_mat'])})
-
-                l = len(good_matches)
-
-                if max_match_count < l:
-                    max_match_count = l
-                match_lock.release()
+                    match_lock.release()
                 matching_queue.task_done()
-            except:
+            except Exception as e:
+                print(e)
                 pass
-
+    threads = []
+    for i in range(num_threads):
+        threads.append(threading.Thread(target=match_worker))
+        threads[i].start()
 
     # do matches with every image in the database
     for name, info in database.items():
@@ -172,7 +146,7 @@ def _match_database_multi(query, database,
 def match_database(query, database,
         point_match_threshold = 0.7,
         discrimination_threshold = 0.6,
-        max_matches = 3,
+        max_matches = 5,
         numthreads = 1):
     if numthreads == 1:
         return _match_database_s(
@@ -203,7 +177,7 @@ if __name__ == '__main__':
     query_image = cv.imread(query_image_path)
 
     # load database
-    database = load_database(database_dir)
+    database = db.load_database(database_dir)
 
     # find feature matches
-    matches = match_database(query_image, database, numthreads=16)
+    matches = match_database(query_image, database, max_matches = 5, numthreads=16)

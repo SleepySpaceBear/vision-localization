@@ -4,7 +4,18 @@ import cv2 as cv
 import numpy as np
 import scipy.io as sio
 import shutil
-import json
+import pickle
+import copyreg
+
+
+def _pickle_keypoints(point):
+    """
+    Work around for pickling cv.KeyPoints
+    From: https://stackoverflow.com/questions/10045363/pickling-cv2-keypoint-causes-picklingerror
+    """
+    return cv.KeyPoint, (*point.pt, point.size, point.angle,
+                      point.response, point.octave, point.class_id)
+copyreg.pickle(cv.KeyPoint().__class__, _pickle_keypoints)
 
 def find(item, lis, key=None, equality=None):
     """
@@ -35,6 +46,16 @@ def find(item, lis, key=None, equality=None):
                     return True
     return False
 
+def make_matcher():
+    FLANN_INDEX_LSH = 6
+    index_params = dict(algorithm = FLANN_INDEX_LSH,
+                   table_number = 6,
+                   key_size = 12,     
+                   multi_probe_level = 1)
+    search_params = dict(checks=50)
+    return cv.FlannBasedMatcher(index_params, search_params)
+    
+
 def load_image_structs(path):
     """
     Loads the image structure format for the ActiveVision Dataset
@@ -48,7 +69,6 @@ def load_image_structs(path):
     image_structs = sio.loadmat(path)
     image_structs = image_structs['image_structs']
     image_structs = image_structs[0]
-    
     return image_structs
 
 def init_database_descriptors(image_structs, images_path, printing=False):
@@ -62,19 +82,22 @@ def init_database_descriptors(image_structs, images_path, printing=False):
     """
     database = {}
 
-    sift = cv.SIFT_create()
+    orb = cv.ORB_create()
 
     # move images to database dict and set-up descriptors
     for image in image_structs:
         name = ''.join(image[0]) 
         img = cv.imread(os.path.join(images_path, name))
-        desc = sift.detectAndCompute(img, None)[1]
-        database[name] = { 
-                    'so_mat': image[1].tolist(),
-                    'pos': image[2].tolist(),
-                    'view_dir': image[3].tolist(),
-                    'kp_desc': desc
-                }
+        kp, desc= orb.detectAndCompute(img, None)
+        if desc is not None and len(desc) > 2:
+            database[name] = { 
+                        'so_mat': image[1].tolist(),
+                        'pos': image[2].flatten().tolist(),
+                        'view_dir': (image[3].flatten() / 
+                                     np.linalg.norm(image[3])).tolist(),
+                        'kp': kp,
+                        'desc': desc
+                    }
         if printing:
             print('%s has been initialized in the database' % name) 
     
@@ -82,15 +105,40 @@ def init_database_descriptors(image_structs, images_path, printing=False):
         print('Database fully initialized!')
     return database
 
+def match_images(des1, des2, matcher, point_match_threshold, k=2):
+    # match keypoints
+    matches = matcher.knnMatch(des1, des2, k=k)
+    
+    good_matches = []
+
+    for m in matches:
+        if len(m) == 2:
+            if m[0].distance < m[1].distance * point_match_threshold:
+                good_matches.append(m[0])
+        if len(m) == 1:
+            good_matches.append(m[0])
+
+    return good_matches
+
+def match_images_count(des1, des2, matcher, point_match_threshold, k=2):
+    matches = matcher.knnMatch(des1, des2, k=k)
+    match_count = 0
+
+    for m in matches:
+        if len(m) == 2:
+            if m[0].distance < m[1].distance * point_match_threshold:
+                match_count += 1
+        if len(m) == 1:
+            match_count += 1
+
+    return match_count
+
 
 def _match_database_single(database, 
                            point_match_threshold,
                            discrimination_threshold,
                            printing = False):
-    FLANN_INDEX_KDTREE = 1
-    index_params = dict(algorithm = FLANN_INDEX_KDTREE, trees = 5)
-    search_params = dict(checks = 50)
-    flann = cv.FlannBasedMatcher(index_params, search_params)
+    matcher = make_matcher()
 
     for name, params in database.items():
         if 'matches' not in params:
@@ -105,25 +153,21 @@ def _match_database_single(database,
                 other_params['matches'] = {}
             
             if name not in other_params['matches']:
-                # match keypoints
-                matches = flann.knnMatch(
-                            params['kp_desc'], 
-                            other_params['kp_desc'], 
-                            k=2)
-
-                # count good matches
                 match_count = 0
-                for m,n in matches:
-                    if m.distance < n.distance * point_match_threshold:
-                        match_count += 1
+                if np.dot(np.array(params['view_dir'], 
+                          np.array(other_params['view_dir']))) > 0:
+                    
+                    match_count = match_images_count(
+                                    params['desc'],
+                                    other_params['desc'],
+                                    matcher,
+                                    point_match_threshold)
 
-                    database[name]['matches'][other_name] = match_count
-                    database[other_name]['matches'][name] = match_count
+                database[name]['matches'][other_name] = match_count
+                database[other_name]['matches'][name] = match_count
     
     # get rid of false matches
     for name, params in database.items():
-        del(params['kp_desc']) 
-        
         max_matches = 0
         match_list = []
         for _, elem in params['matches'].items():
@@ -164,39 +208,35 @@ def _match_database_multi(database,
 
     def match_images_work():
         # set-up matcher
-        FLANN_INDEX_KDTREE = 1
-        index_params = dict(algorithm = FLANN_INDEX_KDTREE, trees = 5)
-        search_params = dict(checks = 50)
-        flann = cv.FlannBasedMatcher(index_params, search_params)
-         
+        matcher = make_matcher()
+
         while not finished:
-            try: 
-                work = match_queue.get(timeout=0.05)
+            try:
+                work = match_queue.get(timeout=0.01)
                 n1 = work[0]
                 n2 = work[1]
                 des1 = work[2]
                 des2 = work[3]
 
-                # match keypoints
-                matches = flann.knnMatch(des1, des2, k=2)
+                match_count = match_images_count(des1, 
+                        des2, 
+                        matcher, 
+                        point_match_threshold)
 
-                # count good matches
-                match_count = 0
-                for m,n in matches:
-                    if m.distance < n.distance * point_match_threshold:
-                        match_count += 1
-        
                 locks[n1].acquire()
-                locks[n2].acquire()
                 database[n1]['matches'][n2] = match_count
+                locks[n1].release()
+                
+                locks[n2].acquire()
                 database[n2]['matches'][n1] = match_count
                 locks[n2].release()
-                locks[n1].release()
+                
                 match_queue.task_done()
+                
                 if printing:
-                    print('%s matched with %s!' % (n1, n2))
-            except:
-                pass
+                    print('%s has been matched with %s!' % (n1, n2))
+            except Exception as e:
+                print(e)
 
     threads = []
     for i in range(num_threads):
@@ -217,23 +257,22 @@ def _match_database_multi(database,
                 locks[other_name] = threading.Lock()
                 other_params['matches'] = {}
 
-            locks[name].acquire()
             locks[other_name].acquire()
             if name not in other_params['matches']:
-                params['matches'][other_name] = 0
                 other_params['matches'][name] = 0
-                
                 locks[other_name].release()
+                
+                locks[name].acquire()
+                params['matches'][other_name] = 0
                 locks[name].release()
                 
-                match_queue.put((name, other_name,
-                        database[name]['kp_desc'],
-                        database[other_name]['kp_desc']))
+                if np.dot(np.array(params['view_dir']), np.array(other_params['view_dir'])) > 0:
+                    match_queue.put((name, other_name,
+                            database[name]['desc'],
+                            database[other_name]['desc']))
             
             if locks[other_name].locked():
                 locks[other_name].release()
-            if locks[name].locked():
-                locks[name].release()
             
     
     if printing:
@@ -244,8 +283,6 @@ def _match_database_multi(database,
     
     # get rid of false matches
     for name, params in database.items():
-        del(params['kp_desc']) 
-        
         max_matches = 0
         match_list = []
         for _, elem in params['matches'].items():
@@ -364,13 +401,22 @@ def generate_database(image_structs,
     return database
 
 def save_database(database, database_path, image_path):
-    json_file = open(os.path.join(database_path, 'image_info.json'), 'w')
+
+    database_file_path = os.path.join(database_path, 'database.dat')
+    database_file = open(database_file_path, 'wb')
+    pickle.dump(database, database_file)
 
     # move the image files
     for name in database.keys():
         shutil.copyfile(os.path.join(image_path, name), 
                         os.path.join(database_path, name))
-    json.dump(database, json_file)
+
+def load_database(database_path):
+    if os.path.basename(database_path) != 'database.dat':
+        database_path = os.path.join(database_path, 'database.dat')
+    
+    database_file = open(database_path, 'rb')
+    return pickle.load(database_file)
 
 if __name__ == '__main__':
     # argv[1] = database path

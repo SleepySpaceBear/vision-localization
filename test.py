@@ -9,7 +9,7 @@ if __name__ == '__main__':
     # argv[1]: database
     # argv[2]: dataset
 
-    database = vl.load_database(sys.argv[1])
+    database = db.load_database(sys.argv[1])
 
     image_structs_path = os.path.join(sys.argv[2], 'image_structs.mat') 
     image_structs = db.load_image_structs(image_structs_path)
@@ -22,7 +22,7 @@ if __name__ == '__main__':
             image_path = os.path.join(sys.argv[2], 'jpg_rgb', image_name)
             image = cv.imread(image_path)
             
-            res = vl.match_database(image, database,16)
+            res = vl.match_database(image, database, numthreads=1)
             if res != None:
                 match_count += 1
                 print(image_name + ': match found')
